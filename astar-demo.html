@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neon A* – interactive flood‑fill (v5)</title>
+  <style>
+    html,body{margin:0;height:100%;background:#000;color:#f8d87d;font-family:sans-serif;overflow:hidden}
+    #overlay{position:fixed;left:20px;bottom:20px;z-index:10;font-size:14px;line-height:1.2em;pointer-events:none}
+    #overlay span{display:inline-block;min-width:70px}
+    #ui{position:fixed;top:20px;left:20px;z-index:12;background:#1118;padding:10px 14px;border-radius:8px;font-size:14px;display:flex;align-items:center;gap:12px}
+    #ui label{display:flex;align-items:center;gap:4px}
+    #ui input[type=range]{width:120px}
+    #ui button{cursor:pointer;border:none;border-radius:4px;padding:6px 12px;background:#ffb300;color:#000;font-weight:600}
+    /* ==== labels on dots ==== */
+    .label{pointer-events:none;font-weight:700;font-size:14px;text-shadow:0 0 6px #fff;white-space:nowrap}
+    .label.start{color:#7cff7c}
+    .label.goal {color:#ff7c7c}
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+      "three/examples/jsm/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <label>Speed <input id="speed" type="range" min="1" max="60" step="1" value="10"></label>
+    <button id="restart">Restart</button>
+  </div>
+  <div id="overlay">🔄 loading…</div>
+
+  <script type="module">
+    /* ============ imports */
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+    import { RenderPass }     from 'three/examples/jsm/postprocessing/RenderPass.js';
+    import { UnrealBloomPass }from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+    import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
+    import { LineMaterial }   from 'three/examples/jsm/lines/LineMaterial.js';
+    import { LineSegments2 }  from 'three/examples/jsm/lines/LineSegments2.js';
+    import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+    import gsap              from 'https://cdn.jsdelivr.net/npm/gsap@3.12.5/+esm';
+
+    /* ============ global UI refs */
+    const overlay=document.getElementById('overlay');
+    const speedSlider=document.getElementById('speed');
+    const restartBtn=document.getElementById('restart');
+
+    /* ============ constants */
+    const CITY_BBOX='41.83,-87.72,41.93,-87.60';
+    const R=6378137,toRad=THREE.MathUtils.degToRad,hypot=Math.hypot;
+    const merc=(lon,lat)=>[R*toRad(lon),R*Math.log(Math.tan(Math.PI/4+toRad(lat)/2))];
+    const EDGE_LIMIT=12000;
+
+    /* ============ THREE bootstrap */
+    const scene=new THREE.Scene();
+    const camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,0.1,1e7);
+    const renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth,innerHeight);
+    renderer.toneMapping=THREE.ACESFilmicToneMapping;
+    document.body.appendChild(renderer.domElement);
+
+    // Label renderer (CSS2D)
+    const labelRenderer=new CSS2DRenderer();
+    labelRenderer.setSize(innerWidth,innerHeight);
+    labelRenderer.domElement.style.position='fixed';
+    labelRenderer.domElement.style.top='0';
+    labelRenderer.domElement.style.pointerEvents='none';
+    labelRenderer.domElement.style.zIndex='11';
+    document.body.appendChild(labelRenderer.domElement);
+
+    /* post‑processing */
+    const composer=new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene,camera));
+    const bloomPass=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),1.5,0.4,0.9);
+    composer.addPass(bloomPass);
+
+    addEventListener('resize',()=>{
+      camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth,innerHeight);
+      composer.setSize(innerWidth,innerHeight);
+      labelRenderer.setSize(innerWidth,innerHeight);
+      gBase.children.forEach(l=>l.material?.resolution?.set(innerWidth,innerHeight));
+    });
+
+    /* groups */
+    const root=new THREE.Group();scene.add(root);
+    const gBase=new THREE.Group(),gWave=new THREE.Group(),gPath=new THREE.Group();root.add(gBase,gWave,gPath);
+
+    /* materials */
+    const matWave=new THREE.LineBasicMaterial({color:0xffd06b,transparent:true,opacity:0.9});
+    const matPath=new THREE.LineBasicMaterial({color:0xffd06b,linewidth:3});
+
+    const ballG=new THREE.SphereGeometry(60,20,20);
+    const dotStart=new THREE.Mesh(ballG,new THREE.MeshBasicMaterial({color:0x7cff7c}));
+    const dotGoal =new THREE.Mesh(ballG,new THREE.MeshBasicMaterial({color:0xff7c7c}));
+    dotStart.scale.setScalar(1.8);
+    dotGoal.scale.setScalar(1.8);
+
+    // Labels
+    const makeLabel=(txt,cls)=>{
+      const el=document.createElement('div');el.className=`label ${cls}`;el.textContent=txt;return new CSS2DObject(el);
+    };
+    const lblStart=makeLabel('Start','start');
+    const lblGoal =makeLabel('Goal','goal');
+    dotStart.add(lblStart); lblStart.position.set(0,-90,0); // push under sphere
+    dotGoal.add(lblGoal);   lblGoal.position.set(0,-90,0);
+
+    /* ============ state */
+    let graph,startId,goalId;
+    let runStamp=0;
+    let expansionsPerFrame=Number(speedSlider.value);
+
+    speedSlider.addEventListener('input',e=>{expansionsPerFrame=Number(e.target.value);});
+    restartBtn.addEventListener('click',()=>restart());
+
+    /* ============ load graph */
+    (async()=>{graph=await fetchGraph(); computeBounds(); drawBase(); restart();})();
+
+    async function fetchGraph(){
+      overlay.textContent='📡 fetching streets…';
+      const q=`[out:json][timeout:25];(way["highway"](${CITY_BBOX}););(._;>;);out body;`;
+      const res=await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`);
+      if(!res.ok){overlay.textContent='❌ Overpass error';throw new Error('overpass');}
+      const data=await res.json();
+      const raw=new Map();data.elements.filter(e=>e.type==='node').forEach(n=>raw.set(n.id,{lon:n.lon,lat:n.lat}));
+      const nodes=new Map();const edges=[];
+      data.elements.filter(e=>e.type==='way').forEach(w=>{
+        const cls=w.tags?.highway||'other';
+        for(let i=1;i<w.nodes.length;i++){
+          const aId=w.nodes[i-1],bId=w.nodes[i];
+          const aR=raw.get(aId),bR=raw.get(bId);
+          if(!aR||!bR)continue;
+          const [ax,ay]=merc(aR.lon,aR.lat),[bx,by]=merc(bR.lon,bR.lat);
+          let a=nodes.get(aId);if(!a){a={id:aId,x:ax,y:ay,edges:[]};nodes.set(aId,a);} 
+          let b=nodes.get(bId);if(!b){b={id:bId,x:bx,y:by,edges:[]};nodes.set(bId,b);} 
+          const d=hypot(ax-bx,ay-by);
+          a.edges.push({to:bId,w:d});
+          b.edges.push({to:aId,w:d});
+          edges.push([a,b,cls]);
+        }
+      });
+      overlay.textContent='✅ streets ready'; return {nodes,edges};
+    }
+
+    /* bounds for centering */
+    let centerX=0,centerY=0,maxDim=1;
+    function computeBounds(){
+      let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+      for(const n of graph.nodes.values()){if(n.x<minX)minX=n.x;if(n.x>maxX)maxX=n.x;if(n.y<minY)minY=n.y;if(n.y>maxY)maxY=n.y;}
+      centerX=(minX+maxX)/2;centerY=(minY+maxY)/2;maxDim=Math.max(maxX-minX,maxY-minY);
+    }
+
+    /* draw base network with width by class (screen‑space) */
+    function drawBase(){
+      const ranked=graph.edges.slice(0,EDGE_LIMIT);
+      const groups={};
+      ranked.forEach(e=>{(groups[e[2]]??=[]).push(e);});
+
+      const widthLUT={motorway:30,trunk:24,primary:18,secondary:12,tertiary:8,residential:4,other:2};
+      const color=0x2e2111;
+
+      for(const [cls,list] of Object.entries(groups)){
+        const arr=new Float32Array(list.length*6);
+        list.forEach((e,i)=>{arr.set([e[0].x,e[0].y,0,e[1].x,e[1].y,0],i*6);});
+        const geo=new LineSegmentsGeometry();
+        geo.setPositions(arr);
+        const mat=new LineMaterial({color,transparent:true,opacity:0.28,linewidth:widthLUT[cls]||2});
+        mat.resolution.set(innerWidth,innerHeight);
+        const lines=new LineSegments2(geo,mat);
+        gBase.add(lines);
+      }
+    }
+
+    /* camera helper (20% safe padding) */
+    function fitCamera(pA,pB){
+      const ax=pA.x-centerX, ay=pA.y-centerY;
+      const bx=pB.x-centerX, by=pB.y-centerY;
+      const midX=(ax+bx)/2, midY=(ay+by)/2;
+      const dx=Math.abs(ax-bx), dy=Math.abs(ay-by);
+      const pad=1.2; // 20% padding
+      const vFov=camera.fov*THREE.MathUtils.DEG2RAD;
+      const hFov=2*Math.atan(Math.tan(vFov/2)*camera.aspect);
+      const distH=(dx*pad)/2/Math.tan(hFov/2);
+      const distV=(dy*pad)/2/Math.tan(vFov/2);
+      const dist=Math.max(distH,distV,1);
+      camera.position.set(midX,midY,dist);
+      camera.lookAt(midX,midY,0);
+    }
+
+    /* restart */
+    function restart(){
+      runStamp++;
+      gWave.clear();gPath.clear();
+      dotStart.visible=false;dotGoal.visible=false;
+      startId=randomNode();
+      goalId=randomNode(startId);
+      const s=graph.nodes.get(startId),g=graph.nodes.get(goalId);
+      dotStart.position.set(s.x,s.y,0);
+      dotGoal.position.set(g.x,g.y,0);
+      dotStart.visible=true;dotGoal.visible=true;root.add(dotStart,dotGoal);
+      root.position.set(-centerX,-centerY,0);
+      fitCamera(s,g);
+      runWave(runStamp);
+    }
+
+    const randomNode=ex=>{
+      const a=[...graph.nodes.keys()].filter(id=>id!==ex);
+      return a[Math.floor(Math.random()*a.length)];
+    };
+
+    /* A* */
+    class Heap{constructor(){this.a=[];}push(id,f){this.a.push({id,f});this.#u();}pop(){if(!this.a.length)return null;const t=this.a[0],l=this.a.pop();if(this.a.length){this.a[0]=l;this.#d();}return t;}#u(){let i=this.a.length-1;while(i){let p=(i-1)>>1;if(this.a[i].f<this.a[p].f){[this.a[i],this.a[p]]=[this.a[p],this.a[i]];i=p;}else break;}}#d(){let i=0;for(;;){let l=i*2+1,r=l+1,s=i;if(l<this.a.length&&this.a[l].f<this.a[s].f)s=l;if(r<this.a.length&&this.a[r].f<this.a[s].f)s=r;if(s===i)break;[this.a[i],this.a[s]]=[this.a[s],this.a[i]];i=s;}}}
+
+    function runWave(stamp){
+      const open=new Heap();const gScore=new Map([[startId,0]]);const came=new Map();const closed=new Set();
+      const goalNode=graph.nodes.get(goalId);
+      const h=id=>{const n=graph.nodes.get(id);return hypot(n.x-goalNode.x,n.y-goalNode.y);} ;
+      open.push(startId,h(startId));
+      let steps=0;
+
+      function batch(){ if(stamp!==runStamp) return; // canceled
+        let cnt=0;const edges=[];
+        while(cnt<expansionsPerFrame){const cur=open.pop();if(!cur)break;const id=cur.id;if(closed.has(id))continue;closed.add(id);if(id===goalId){finalize();return;}const node=graph.nodes.get(id);for(const {to,w} of node.edges){if(closed.has(to))continue;const tentative=gScore.get(id)+w;if(tentative<(gScore.get(to)||Infinity)){gScore.set(to,tentative);came.set(to,id);}open.push(to,tentative+h(to));edges.push([id,to]);}cnt++;}
+        edges.forEach(([a,b])=>drawEdge(a,b));
+        overlay.innerHTML=`<span>step:</span>${steps+=cnt}<br><span>open:</span>${open.a.length}`;
+        if(open.a.length)requestAnimationFrame(batch);
+      }
+
+      function drawEdge(aId,bId){
+        const a=graph.nodes.get(aId),b=graph.nodes.get(bId);
+        const geo=new THREE.BufferGeometry();
+        geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array([a.x,a.y,0,b.x,b.y,0]),3));
+        const line=new THREE.Line(geo,matWave.clone());
+        gWave.add(line);
+        gsap.from(line.material,{opacity:0,duration:0.3});
+      }
+
+      function finalize(){
+        overlay.textContent='🏁 path found';
+        const path=[];let c=goalId;while(came.has(c)){const p=came.get(c);path.unshift([p,c]);c=p;}
+        const arr=new Float32Array(path.length*6);
+        path.forEach((e,i)=>{const a=graph.nodes.get(e[0]),b=graph.nodes.get(e[1]);arr.set([a.x,a.y,0,b.x,b.y,0],i*6);});
+
+        // final path (permanent, thin)
+        const pathGeo=new THREE.BufferGeometry();
+        pathGeo.setAttribute('position',new THREE.BufferAttribute(arr,3));
+        gPath.add(new THREE.LineSegments(pathGeo,matPath.clone()));
+
+        // FLASH (screen‑space thick white)
+        const flashGeo=new LineSegmentsGeometry();
+        flashGeo.setPositions(arr);
+        const flashMat=new LineMaterial({color:0xffffff,transparent:true,opacity:1,linewidth:20});
+        flashMat.resolution.set(innerWidth,innerHeight);
+        const flashLine=new LineSegments2(flashGeo,flashMat);
+        gPath.add(flashLine);
+        gsap.fromTo(flashMat,{opacity:1},{opacity:0,duration:2,ease:'power2.out',onComplete:()=>gPath.remove(flashLine)});
+        gsap.fromTo(bloomPass,{strength:1.5},{strength:8,duration:0.4,yoyo:true,repeat:1,ease:'power2.inOut'});
+
+        // dim other layers
+        gsap.to(gWave.children,{opacity:0.05,duration:2});
+        gsap.to(gBase.children,{opacity:0.06,duration:2});
+      }
+
+      batch();
+    }
+
+    /* render */
+    (function l(){requestAnimationFrame(l);composer.render();labelRenderer.render(scene,camera);})();
+  </script>
+</body>
+</html>
